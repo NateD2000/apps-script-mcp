@@ -1,0 +1,6 @@
+.git
+.gitignore
+README.md
+deploy.sh
+src/server_test.ts
+*.env

@@ -16,11 +16,25 @@ Google Cloud Run (free tier) and is added to claude.ai as a custom connector.
 | `list_versions` / `create_version` / `restore_version` | Snapshots and rollback |
 | `list_deployments` / `create_deployment` / `update_deployment` | Web app and API deployments |
 | `list_executions` | Recent runs with status, to see if triggers ran or failed |
+| `run_function` | Run a function and get its return value (see below) |
 | `list_script_projects` | Only with `ENABLE_DRIVE_LISTING=true` (needs a restricted Drive scope) |
 
 Edits save to the project's current code at once, the same as pressing Save in the editor.
 Triggers use the new code on their next run. Every edit tool takes `create_version_first: true`
 to snapshot the old code first.
+
+## Running functions
+
+`run_function` calls the Apps Script API's `scripts.run`. Google allows it only when:
+
+1. The script has an API executable deployment. Add `"executionApi": {"access": "MYSELF"}` to
+   `appsscript.json`, then `create_version` and `create_deployment`.
+2. The script is linked to this connector's Google Cloud project (editor: Project Settings >
+   Google Cloud Platform project > Change project, enter the project number).
+3. Your sign-in includes every scope the script uses. Put them in `EXTRA_GOOGLE_SCOPES`, then
+   disconnect and reconnect the connector in Claude.
+
+`dev_mode` (default true) runs the latest saved code, which only the script's owner can do.
 
 ## How sign-in works
 
@@ -48,6 +62,7 @@ to snapshot the old code first.
 | `TOKEN_SECRET` | no | Separate sealing key (deploy.sh makes a random one); defaults to the client secret |
 | `ENABLE_DRIVE_LISTING` | no | `true` adds `list_script_projects` |
 | `EXTRA_REDIRECT_URIS` | no | More allowed OAuth redirect URIs |
+| `EXTRA_GOOGLE_SCOPES` | no | Scopes added to sign-in so `run_function` can run scripts that use them, e.g. `spreadsheets, drive, gmail.modify, calendar` |
 
 The client secret and token secret are plain environment variables on the service, visible only to
 people with access to the Cloud project. Rotating either one signs Claude out.

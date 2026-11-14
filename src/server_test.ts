@@ -1,5 +1,5 @@
 import { assert, assertEquals, assertMatch, assertStringIncludes } from "@std/assert";
-import { b64url, type Config, makeHandler, routePath } from "./server.ts";
+import { b64url, type Config, makeHandler, parseScopes, routePath } from "./server.ts";
 
 const BASE = "https://apps-script-mcp-123456789.us-central1.run.app";
 const cfg: Config = {
@@ -78,6 +78,22 @@ const fakeFetch: typeof fetch = async (input, init) => {
       return j({ versionNumber: n });
     }
     if (rest === "") return j({ scriptId: id, title: "Holmes", updateTime: "2026-11-08T00:00:00Z" });
+  }
+  const run = url.pathname.match(/^\/v1\/scripts\/([^/]+):run$/);
+  if (url.host === "script.googleapis.com" && run && method === "POST") {
+    const b = JSON.parse(String(body));
+    if (!store[decodeURIComponent(run[1])]) return j({ error: { message: "Requested entity was not found." } }, 404);
+    if (b.function === "boom") {
+      return j({
+        done: true,
+        error: {
+          code: 3,
+          message: "ScriptError",
+          details: [{ errorMessage: "Oops", errorType: "Error", scriptStackTraceElements: [{ function: "boom", lineNumber: 4 }] }],
+        },
+      });
+    }
+    return j({ done: true, response: { result: { fn: b.function, args: b.parameters, dev: b.devMode } } });
   }
   if (url.host === "script.googleapis.com" && url.pathname === "/v1/processes:listScriptProcesses") {
     return j({
@@ -442,5 +458,33 @@ Deno.test("drive listing tool is hidden unless enabled", async () => {
   );
   const names = (await r.json()).result.tools.map((x: { name: string }) => x.name);
   assert(!names.includes("list_script_projects"));
-  assertEquals(names.length, 13);
+  assertEquals(names.length, 14);
+});
+
+Deno.test("run_function returns the result and passes dev mode", async () => {
+  reset();
+  const t = await tokens();
+  const out = (await tool(t.access_token, "run_function", { script_id: SID, function_name: "hello", parameters: [1, "a"] })).content[0].text;
+  const r = JSON.parse(out);
+  assertEquals(r.ok, true);
+  assertEquals(r.result, { fn: "hello", args: [1, "a"], dev: true });
+});
+
+Deno.test("run_function reports script errors with a stack", async () => {
+  reset();
+  const t = await tokens();
+  const r = JSON.parse((await tool(t.access_token, "run_function", { script_id: SID, function_name: "boom" })).content[0].text);
+  assertEquals(r.ok, false);
+  assertEquals(r.error, "Oops");
+  assertEquals(r.stack, ["boom:4"]);
+});
+
+Deno.test("parseScopes expands short names", () => {
+  assertEquals(parseScopes("spreadsheets, gmail.modify openid https://x.test/s"), [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "openid",
+    "https://x.test/s",
+  ]);
+  assertEquals(parseScopes(""), []);
 });

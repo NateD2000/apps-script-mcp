@@ -56,7 +56,7 @@ yaml_quote() { printf "'%s'" "${1//\'/\'\'}"; }
 
 DEPLOY_ARGS=(
   --source . --region "$REGION" --allow-unauthenticated
-  --min-instances 0 --max-instances 2 --memory 256Mi --cpu 1 --concurrency 80 --timeout 60
+  --min-instances 0 --max-instances 2 --memory 256Mi --cpu 1 --concurrency 80 --timeout 360
   --quiet
 )
 

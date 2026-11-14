@@ -20,9 +20,12 @@
 //   ENABLE_DRIVE_LISTING  (optional) "true" adds the list_script_projects tool. It needs Google's
 //                         restricted drive.metadata.readonly scope, which unverified apps may be
 //                         refused, so it is off by default.
+//   EXTRA_GOOGLE_SCOPES   (optional) comma- or space-separated Google scopes added to sign-in, so
+//                         run_function can run scripts that use them. Short names work:
+//                         "spreadsheets, drive, gmail.modify" or full https://www.googleapis.com/auth/... URLs.
 
 export const FUNCTION_NAME = "apps-script-mcp";
-const SERVER_VERSION = "1.0.0";
+const SERVER_VERSION = "1.1.0";
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MCP_SCOPE = "apps_script";
 
@@ -59,6 +62,7 @@ export interface Config {
   tokenSecret: string;
   extraRedirects: string[];
   driveListing?: boolean;
+  extraScopes?: string[];
 }
 
 function env(name: string): string {
@@ -86,7 +90,17 @@ export function loadConfig(): Config | string {
     tokenSecret: env("TOKEN_SECRET") || googleClientSecret,
     extraRedirects: env("EXTRA_REDIRECT_URIS").split(",").map((s) => s.trim()).filter(Boolean),
     driveListing: env("ENABLE_DRIVE_LISTING").toLowerCase() === "true",
+    extraScopes: parseScopes(env("EXTRA_GOOGLE_SCOPES")),
   };
+}
+
+export function parseScopes(raw: string): string[] {
+  const out = raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean).map((s) =>
+    /^https?:\/\//.test(s) || s === "openid" || s === "email" || s === "profile"
+      ? s
+      : `https://www.googleapis.com/auth/${s.replace(/^\/+/, "")}`
+  );
+  return [...new Set(out)];
 }
 
 // ---------------------------------------------------------------- sealing
@@ -391,7 +405,10 @@ async function handleAuthorize(cfg: Config, url: URL): Promise<Response> {
   g.searchParams.set("client_id", cfg.googleClientId);
   g.searchParams.set("redirect_uri", `${cfg.baseUrl}/oauth/google/callback`);
   g.searchParams.set("response_type", "code");
-  g.searchParams.set("scope", [...GOOGLE_SCOPES, ...(cfg.driveListing ? [DRIVE_SCOPE] : [])].join(" "));
+  g.searchParams.set(
+    "scope",
+    [...new Set([...GOOGLE_SCOPES, ...(cfg.driveListing ? [DRIVE_SCOPE] : []), ...(cfg.extraScopes ?? [])])].join(" "),
+  );
   g.searchParams.set("access_type", "offline");
   g.searchParams.set("prompt", "consent");
   g.searchParams.set("include_granted_scopes", "true");
@@ -1216,6 +1233,71 @@ export const TOOLS: ToolDef[] = [
       return JSON.stringify({ runs, next_page_token: d.nextPageToken ?? null }, null, 2);
     },
   },
+  {
+    name: "run_function",
+    title: "Run a function",
+    description:
+      "Run a top-level function in a project through the Apps Script API and return its result. Google only allows this when (1) the project has an API executable deployment (create_deployment makes one if the manifest has \"executionApi\": {\"access\": \"MYSELF\"}), (2) the project is linked to the same Google Cloud project as this connector (Project Settings > Google Cloud Platform project), and (3) the user signed in to this connector with every scope the script uses. dev_mode true (the default) runs the latest saved code; false runs the deployed version. Runs as the signed-in user and can change real data.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        script_id: SCRIPT_ID_PROP,
+        function_name: { type: "string", description: "Name of a top-level function, e.g. myFunction." },
+        parameters: {
+          type: "array",
+          description: "Arguments passed to the function, in order. Strings, numbers, booleans, arrays and plain objects only.",
+          items: {},
+        },
+        dev_mode: { type: "boolean", description: "Run the latest saved code instead of the deployed version. Default true." },
+      },
+      required: ["script_id", "function_name"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    run: async (api, a) => {
+      const id = scriptId(a);
+      const fn = str(a, "function_name").trim();
+      if (!/^[A-Za-z_$][\w$]*$/.test(fn)) throw new Error("function_name must be a plain function name");
+      const params = a.parameters ?? [];
+      if (!Array.isArray(params)) throw new Error("parameters must be an array");
+      let d;
+      try {
+        d = await api.call("POST", `${SCRIPT_API}/scripts/${encodeURIComponent(id)}:run`, {
+          function: fn,
+          parameters: params,
+          devMode: a.dev_mode !== false,
+        });
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        if (/404|not found/i.test(m)) {
+          throw new Error(
+            `${m}. Usually the project has no API executable deployment, or it isn't linked to the connector's Google Cloud project.`,
+          );
+        }
+        if (/403|permission/i.test(m)) {
+          throw new Error(
+            `${m}. Usually the script needs a scope this sign-in doesn't have (add it to EXTRA_GOOGLE_SCOPES and reconnect), or the project is linked to a different Google Cloud project.`,
+          );
+        }
+        throw e;
+      }
+      if (d.error) {
+        // deno-lint-ignore no-explicit-any
+        const det = (d.error.details ?? []).find((x: any) => x.errorMessage) ?? {};
+        return JSON.stringify(
+          {
+            ok: false,
+            error: det.errorMessage ?? d.error.message ?? "Script error",
+            error_type: det.errorType,
+            // deno-lint-ignore no-explicit-any
+            stack: (det.scriptStackTraceElements ?? []).map((s: any) => `${s.function}:${s.lineNumber}`),
+          },
+          null,
+          2,
+        );
+      }
+      return JSON.stringify({ ok: true, result: d.response?.result ?? null }, null, 2);
+    },
+  },
 ];
 
 // ---------------------------------------------------------------- MCP
@@ -1231,7 +1313,7 @@ function rpcError(id: unknown, code: number, message: string) {
 }
 
 const INSTRUCTIONS =
-  "Tools for Google Apps Script projects. Projects are identified by script id or editor URL. Read code with get_project_content before editing. Prefer edit_file for small changes; write_file replaces a whole file. Edits save to the project's current code immediately, so triggers pick them up on their next run. Set create_version_first when a change is risky. Use list_executions to check whether triggers ran or failed.";
+  "Tools for Google Apps Script projects. Projects are identified by script id or editor URL. Read code with get_project_content before editing. Prefer edit_file for small changes; write_file replaces a whole file. Edits save to the project's current code immediately, so triggers pick them up on their next run. Set create_version_first when a change is risky. Use list_executions to check whether triggers ran or failed. run_function runs a function and returns its result; it needs an API executable deployment and a linked Cloud project.";
 
 function toolsFor(cfg: Config): ToolDef[] {
   return cfg.driveListing ? TOOLS : TOOLS.filter((t) => t.name !== "list_script_projects");
